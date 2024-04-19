@@ -15,6 +15,7 @@ using std::unordered_set;
 using std::unordered_map;
 using std::dynamic_pointer_cast;
 using std::mutex;
+using atomic_float = std::atomic<float>;
 
 #define N_CARD 52
 #define N_PLAYER 2
@@ -37,25 +38,28 @@ using std::mutex;
 #define two_card_hash(card1, card2) ((1LL<<(card1)) | (1LL<<(card2)))
 #define tril_idx(r, c) (((r)*((r)-1)>>1)+(c)) // r>c>=0
 
-#define get_size(n_act, n_hand) (((n_act) * 4 + 1) * (n_hand))
+#define get_size(n_act, n_hand) (((n_act) * 3 + 1) * (n_hand))
+#define get_size1(n_act, n_hand) ((n_act) * (n_hand) * sizeof(atomic_float))
 #define cfv_offset(n_hand, act_idx) ((n_hand) * (act_idx))
-#define reach_prob_offset(n_act, n_hand, act_idx) (((n_act) * 3 + (act_idx)) * (n_hand))
-#define reach_prob_to_cfv(n_act, n_hand) ((n_act) * (n_hand) * 3)
+#define reach_prob_offset(n_act, n_hand, act_idx) (((n_act) * 2 + (act_idx)) * (n_hand))
+// #define reach_prob_to_cfv(n_act, n_hand) ((n_act) * (n_hand) * 3)
 
 struct Node {
     int n_act = 0;// 动作数
-    int parent_offset = -1;// 本节点对应的父节点数据reach_prob的偏移量
-    float *parent_cfv = nullptr;
-    mutex *mtx = nullptr;
-    float *data = nullptr;// cfv,regret_sum,strategy_sum,reach_prob,sum
+    int size = 0;
+    atomic_float *parent_cfv = nullptr;
+    float *parent_reach_prob = nullptr;
+    atomic_float *cfv = nullptr;// [n_act,n_hand]
+    // mutex *mtx = nullptr;
+    float *data = nullptr;// regret_sum,strategy_sum,reach_prob,sum
 };
 struct LeafNode {
     float *reach_prob[N_PLAYER] = {nullptr,nullptr};
     size_t info = 0;
 };
 struct PreLeafNode {
-    PreLeafNode(float *cfv):cfv(cfv) {}
-    float *cfv = nullptr;
+    PreLeafNode(atomic_float *cfv):cfv(cfv) {}
+    atomic_float *cfv = nullptr;
     vector<int> leaf_node_idx;
 };
 struct DFSNode {
@@ -137,9 +141,10 @@ private:
     float *ev_ptr = nullptr;
     vector<vector<vector<int>>> slice;
     vector<vector<int>> slice_offset;
-    vector<float> root_cfv, root_prob;// P0_cfv,P1_cfv,P0_prob,P1_prob
+    vector<atomic_float> root_cfv;// P0_cfv,P1_cfv
+    vector<float> root_prob;// P0_prob,P1_prob
     float *root_prob_ptr[N_PLAYER] {nullptr,nullptr};
-    float *root_cfv_ptr[N_PLAYER] {nullptr,nullptr};
+    atomic_float *root_cfv_ptr[N_PLAYER] {nullptr,nullptr};
     shared_ptr<GameTree> tree = nullptr;
     Deck& deck;
     void init_hand_card(vector<PrivateCards> &range1, vector<PrivateCards> &range2);
@@ -149,27 +154,27 @@ private:
     size_t init_memory(shared_ptr<Compairer> compairer);
     size_t init_player_node();
     size_t init_leaf_node();
-    void set_cfv_and_offset(DFSNode &node, int player, float *&cfv, int &offset, mutex *&mtx);
+    void set_cfv_and_prob(DFSNode &node, int player, atomic_float *&cfv, float *&prob);
     void normalization();
     size_t init_strength_table(shared_ptr<Compairer> compairer);
     void dfs(shared_ptr<GameTreeNode> node, int parent_act=-1, int parent_dfs_idx=-1, int parent_p0_act=-1, int parent_p0_idx=-1, int parent_p1_act=-1, int parent_p1_idx=-1, int cnt0=0, int cnt1=0, int info=0);
     void init_poss_card(Deck& deck, size_t board);
     void step(int iter, int player, bool best_cfv=false);
     void leaf_cfv(int player);
-    void fold_cfv(int player, float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, size_t board);
-    void sd_cfv(int player, float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, int idx);
+    void fold_cfv(int player, atomic_float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, size_t board);
+    void sd_cfv(int player, atomic_float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, int idx);
     void append_node_idx(int p_idx, int act_idx, int player, int cpu_node_idx);
     vector<vector<int>> pre_leaf_node_map;// [dfs_idx,act_idx]
     vector<vector<PreLeafNode>> pre_leaf_node;// [player,idx]
     vector<vector<int>> root_child_idx;
     vector<LeafNode> leaf_node;
     vector<Node> player_node;
+    vector<vector<atomic_float>> player_cfv;
     Node *player_node_ptr = nullptr;
     int sd_offset = 0;
-    vector<float> cpu_cfv;
-    vector<mutex> mtx;
-    vector<vector<int>> mtx_map;
-    int mtx_idx = N_PLAYER;
+    // vector<mutex> mtx;
+    // vector<vector<int>> mtx_map;
+    // int mtx_idx = N_PLAYER;
     vector<vector<StrengthData>> strength;
     size_t _estimate_tree_size(shared_ptr<GameTreeNode> node);
     void _reach_prob(int player, bool best_cfv=false);

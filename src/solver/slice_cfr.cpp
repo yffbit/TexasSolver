@@ -2,6 +2,8 @@
 #include "include/solver/slice_cfr.h"
 #include "include/ranges/RiverRangeManager.h"
 
+using std::memory_order_relaxed;
+
 // 数组poss_card的索引[0,51]-->[1,52],8位二进制编码,最多选两个,占用高16位,低16位预留其他用途
 #define code_idx0(i) (((i)+1)<<24)
 #define decode_idx0(x) (((x)>>24) - 1)
@@ -32,9 +34,9 @@ inline bool cards_valid(size_t hash1, size_t hash2) {
 typedef void (*node_func)(Node *, int);
 
 void rm_avg(Node *node, int n_hand) {
-    int size = node->n_act * n_hand;
+    int size = node->size;
     int i = 0, h = 0, sum_offset = size << 1;
-    float *data = node->data + (size << 1);// strategy_sum
+    float *data = node->data + size;// strategy_sum
     float sum = 0;
     for(h = 0; h < n_hand; h++) {
         sum = 0;
@@ -43,9 +45,9 @@ void rm_avg(Node *node, int n_hand) {
     }
 }
 void rm(Node *node, int n_hand) {
-    int size = node->n_act * n_hand;
+    int size = node->size;
     int i = 0, h = 0, sum_offset = size * 3;
-    float *data = node->data + size;// regret_sum
+    float *data = node->data;// regret_sum
     float sum = 0;
     for(h = 0; h < n_hand; h++) {
         sum = 0;
@@ -54,10 +56,10 @@ void rm(Node *node, int n_hand) {
     }
 }
 void reach_prob_avg(Node *node, int n_hand) {
-    int n_act = node->n_act, size = n_act * n_hand;
+    int n_act = node->n_act, size = node->size;
     int i = 0, h = 0, sum_offset = size << 1;
-    float *data = node->data + (size << 1);// strategy_sum
-    float *parent_prob = node->parent_cfv + node->parent_offset, temp = 0;
+    float *data = node->data + size;// strategy_sum
+    float *parent_prob = node->parent_reach_prob, temp = 0;
     for(h = 0; h < n_hand; h++) {
         if(data[sum_offset+h] == 0) {// 1/n_act
             temp = parent_prob[h] / n_act;
@@ -70,10 +72,10 @@ void reach_prob_avg(Node *node, int n_hand) {
     }
 }
 void reach_prob(Node *node, int n_hand) {
-    int n_act = node->n_act, size = n_act * n_hand;
+    int n_act = node->n_act, size = node->size;
     int i = 0, h = 0, rp_offset = size << 1, sum_offset = rp_offset + size;
-    float *data = node->data + size;// regret_sum
-    float *parent_prob = node->parent_cfv + node->parent_offset, temp = 0;
+    float *data = node->data;// regret_sum
+    float *parent_prob = node->parent_reach_prob, temp = 0;
     for(h = 0; h < n_hand; h++) {
         if(data[sum_offset+h] == 0) {// 1/n_act
             temp = parent_prob[h] / n_act;
@@ -87,52 +89,51 @@ void reach_prob(Node *node, int n_hand) {
 }
 // 子节点cfv取最大值
 void best_cfv_up(Node *node, int n_hand) {
-    int size = node->n_act * n_hand;
-    int i = 0, h = 0;
-    float *parent_cfv = node->parent_cfv, *cfv = node->data, val = 0;
-    mutex *mtx = node->mtx;
+    int i = 0, h = 0, size = node->size;
+    atomic_float *parent_cfv = node->parent_cfv, *cfv = node->cfv;
+    float val = 0;
+    // mutex *mtx = node->mtx;
     for(h = 0; h < n_hand; h++) {
-        val = cfv[h];// 第一个
-        for(i = h+n_hand; i < size; i += n_hand) val = max(val, cfv[i]);
-        mtx->lock();
-        parent_cfv[h] += val;// 需要加锁
-        mtx->unlock();
+        val = cfv[h].load(memory_order_relaxed);// 第一个
+        for(i = h+n_hand; i < size; i += n_hand) val = max(val, cfv[i].load(memory_order_relaxed));
+        // mtx->lock();
+        parent_cfv[h].fetch_add(val, memory_order_relaxed);// 需要加锁
+        // mtx->unlock();
     }
 }
 // 子节点cfv加权求和
 void cfv_up(Node *node, int n_hand) {
-    int n_act = node->n_act, size = n_act * n_hand;
-    int i = 0, h = 0, sum_offset = size << 2;
-    float *parent_cfv = node->parent_cfv, *cfv = node->data, val = 0;
-    float *regret_sum = cfv + size;
-    mutex *mtx = node->mtx;
+    int n_act = node->n_act, size = node->size;
+    int i = 0, h = 0, sum_offset = size * 3;
+    atomic_float *parent_cfv = node->parent_cfv, *cfv = node->cfv;
+    float *regret_sum = node->data, val = 0;
+    // mutex *mtx = node->mtx;
     for(h = 0; h < n_hand; h++) {
         val = 0;
-        if(cfv[sum_offset+h] == 0) {
-            for(i = h; i < size; i += n_hand) val += cfv[i];
+        if(regret_sum[sum_offset+h] == 0) {
+            for(i = h; i < size; i += n_hand) val += cfv[i].load(memory_order_relaxed);
             val /= n_act;// uniform strategy
         }
         else {
             for(i = h; i < size; i += n_hand) {
-                val += cfv[i] * max(0.0f, regret_sum[i]);
+                val += cfv[i].load(memory_order_relaxed) * max(0.0f, regret_sum[i]);
             }
-            val /= cfv[sum_offset+h];
+            val /= regret_sum[sum_offset+h];
         }
-        // cfv[sum_offset+h] = val;
-        mtx->lock();
-        parent_cfv[h] += val;// 需要加锁
-        mtx->unlock();
-        for(i = h; i < size; i += n_hand) regret_sum[i] += cfv[i] - val;// 更新regret_sum
+        // mtx->lock();
+        parent_cfv[h].fetch_add(val, memory_order_relaxed);// 需要加锁
+        // mtx->unlock();
+        for(i = h; i < size; i += n_hand) regret_sum[i] += cfv[i].load(memory_order_relaxed) - val;// 更新regret_sum
         val = 0;
         for(i = h; i < size; i += n_hand) val += max(0.0f, regret_sum[i]);
-        cfv[sum_offset+h] = val;// 求和
+        regret_sum[sum_offset+h] = val;// 求和
     }
-    for(i = 0; i < size; i++) cfv[i] = 0;// 清零cfv
+    for(i = 0; i < size; i++) cfv[i].store(0, memory_order_relaxed);// 清零cfv
 }
 // 在cfv_up前执行
-void updata_data(Node *node, int n_hand, float pos_coef, float neg_coef, float coef) {
-    int size = node->n_act * n_hand, i = 0;
-    float *regret_sum = node->data + size, *strategy_sum = regret_sum + size;
+void updata_data(Node *node, float pos_coef, float neg_coef, float coef) {
+    int size = node->size, i = 0;
+    float *regret_sum = node->data, *strategy_sum = regret_sum + size;
     for(i = 0; i < size; i++) {
         regret_sum[i] *= regret_sum[i] > 0 ? pos_coef : neg_coef;
         strategy_sum[i] = strategy_sum[i] * coef + strategy_sum[size+i];
@@ -159,7 +160,7 @@ void SliceCFR::leaf_cfv(int player) {
     // #pragma omp parallel for
     for(int64_t i = 0; i < n; i++) {
         // printf("omp_get_thread_num():%d,%zd\n", omp_get_thread_num(), i);
-        float *cfv = vec[i].cfv;
+        atomic_float *cfv = vec[i].cfv;
         // for(int j = 0; j < my_hand; j++) cfv[j] = 0;
         for(int j : vec[i].leaf_node_idx) {
             LeafNode &node = leaf_node[j];
@@ -176,7 +177,7 @@ void SliceCFR::leaf_cfv(int player) {
     // printf("leaf_cfv:%zd ms\n", timer.ms());
 #endif
 }
-void SliceCFR::fold_cfv(int player, float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, size_t board) {
+void SliceCFR::fold_cfv(int player, atomic_float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, size_t board) {
 #ifdef TIME_LOG
     Timer timer;
 #endif
@@ -199,13 +200,13 @@ void SliceCFR::fold_cfv(int player, float *cfv, float *opp_reach, int my_hand, i
             continue;
         }
         temp = same_hand[i] != -1 ? opp_reach[same_hand[i]] : 0;// 重复计算的部分
-        cfv[i] += (prob_sum - opp_prob_sum[my_card[i]] - opp_prob_sum[my_card[i+my_hand]] + temp) * val;
+        cfv[i].fetch_add((prob_sum - opp_prob_sum[my_card[i]] - opp_prob_sum[my_card[i+my_hand]] + temp) * val, memory_order_relaxed);
     }
 #ifdef TIME_LOG
     fold_time[omp_get_thread_num()] += timer.us();
 #endif
 }
-void SliceCFR::sd_cfv(int player, float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, int idx) {
+void SliceCFR::sd_cfv(int player, atomic_float *cfv, float *opp_reach, int my_hand, int opp_hand, float val, int idx) {
 #ifdef TIME_LOG
     Timer timer;
 #endif
@@ -224,7 +225,7 @@ void SliceCFR::sd_cfv(int player, float *cfv, float *opp_reach, int my_hand, int
             prob_sum += opp_reach[h];
         }
         h = my_data[i].reach_prob_index;
-        cfv[h] += (prob_sum - opp_prob_sum[my_card[h]] - opp_prob_sum[my_card[h+my_hand]]) * val;
+        cfv[h].fetch_add((prob_sum - opp_prob_sum[my_card[h]] - opp_prob_sum[my_card[h+my_hand]]) * val, memory_order_relaxed);
     }
     prob_sum = 0;
     for(h = 0; h < n_card; h++) opp_prob_sum[h] = 0;
@@ -237,7 +238,7 @@ void SliceCFR::sd_cfv(int player, float *cfv, float *opp_reach, int my_hand, int
             prob_sum += opp_reach[h];
         }
         h = my_data[i].reach_prob_index;
-        cfv[h] += (opp_prob_sum[my_card[h]] + opp_prob_sum[my_card[h+my_hand]] - prob_sum) * val;
+        cfv[h].fetch_add((opp_prob_sum[my_card[h]] + opp_prob_sum[my_card[h+my_hand]] - prob_sum) * val, memory_order_relaxed);
     }
 #ifdef TIME_LOG
     sd_time[omp_get_thread_num()] += timer.us();
@@ -250,16 +251,16 @@ void SliceCFR::append_node_idx(int p_idx, int act_idx, int player, int leaf_node
         return;
     }
     vector<PreLeafNode> &vec = pre_leaf_node[player];
-    int n_hand = hand_size[player], offset = reach_prob_to_cfv(dfs_node[p_idx].n_act, n_hand);
-    float *cfv = player_node[dfs_idx_map[p_idx]].data + cfv_offset(n_hand, act_idx);
-    if(pre_leaf_node_map[p_idx].empty()) pre_leaf_node_map[p_idx] = vector<int>(dfs_node[p_idx].n_act, -1);
+    Node &p_node = player_node[dfs_idx_map[p_idx]];// 上级节点
+    int n_act = dfs_node[p_idx].n_act, n_hand = hand_size[player];
+    if(pre_leaf_node_map[p_idx].empty()) pre_leaf_node_map[p_idx] = vector<int>(n_act, -1);
     int &i = pre_leaf_node_map[p_idx][act_idx];
     if(i == -1) {// 未初始化
         i = vec.size();
-        vec.emplace_back(cfv);
+        vec.emplace_back(p_node.cfv + cfv_offset(n_hand, act_idx));
     }
     vec[i].leaf_node_idx.push_back(leaf_node_idx);
-    leaf_node[leaf_node_idx].reach_prob[player] = cfv + offset;
+    leaf_node[leaf_node_idx].reach_prob[player] = p_node.data + reach_prob_offset(n_act, n_hand, act_idx);
 }
 size_t SliceCFR::init_leaf_node() {
     pre_leaf_node_map = vector<vector<int>>(dfs_idx);
@@ -375,7 +376,7 @@ SliceCFR::~SliceCFR() {
     }
 }
 
-void SliceCFR::set_cfv_and_offset(DFSNode &node, int player, float *&cfv, int &offset, mutex *&mtx) {
+void SliceCFR::set_cfv_and_prob(DFSNode &node, int player, atomic_float *&cfv, float *&prob) {
     if(player == -1) player = node.player;// 向上连接同玩家节点
     int p_idx = node.parent_p0_idx, act_idx = node.parent_p0_act;// 向上连接P0
     if(player != P0) {// 向上连接P1
@@ -384,17 +385,13 @@ void SliceCFR::set_cfv_and_offset(DFSNode &node, int player, float *&cfv, int &o
     }
     if(p_idx == -1) {
         cfv = root_cfv_ptr[player];
-        offset = root_prob_ptr[player] - root_cfv_ptr[player];
-        mtx = (mutex *)player;
+        prob = root_prob_ptr[player];
     }
     else {
         if(player != dfs_node[p_idx].player) throw runtime_error("player mismatch");
-        cfv = player_node[dfs_idx_map[p_idx]].data + cfv_offset(hand_size[player], act_idx);
-        offset = reach_prob_to_cfv(dfs_node[p_idx].n_act, hand_size[player]);
-        if(mtx_map[p_idx].empty()) mtx_map[p_idx] = vector<int>(dfs_node[p_idx].n_act, -1);
-        int &i = mtx_map[p_idx][act_idx];
-        if(i == -1) i = mtx_idx++;
-        mtx = (mutex *)i;
+        Node &p_node = player_node[dfs_idx_map[p_idx]];
+        cfv = p_node.cfv + cfv_offset(hand_size[player], act_idx);
+        prob = p_node.data + reach_prob_offset(p_node.n_act, hand_size[player], act_idx);
     }
 }
 
@@ -402,35 +399,40 @@ size_t SliceCFR::init_player_node() {
     size_t total = 0, size = 0;
     player_node = vector<Node>(n_player_node);
     player_node_ptr = player_node.data();
+    player_cfv = vector<vector<atomic_float>>(n_player_node);
     dfs_idx_map = vector<int>(dfs_idx, -1);
     slice_offset = vector<vector<int>>(N_PLAYER);
-    mtx_map = vector<vector<int>>(dfs_idx);
-    mtx_idx = N_PLAYER;
+    // mtx_map = vector<vector<int>>(dfs_idx);
+    // mtx_idx = N_PLAYER;
     int mem_idx = 0;
     for(int i = 0; i < N_PLAYER; i++) {// 枚举player
         for(vector<int> &nodes : slice[i]) {// 枚举slice
             slice_offset[i].push_back(mem_idx);
             for(int idx : nodes) {// 枚举node
                 DFSNode &node = dfs_node[idx];
+                if(node.player != i) throw runtime_error("player error");
                 Node &target = player_node[mem_idx];
                 target.n_act = node.n_act;
-                set_cfv_and_offset(node, -1, target.parent_cfv, target.parent_offset, target.mtx);
-                size = get_size(node.n_act, hand_size[node.player]) * sizeof(float);
+                target.size = node.n_act * hand_size[i];
+                set_cfv_and_prob(node, -1, target.parent_cfv, target.parent_reach_prob);
+                size = get_size(node.n_act, hand_size[i]) * sizeof(float);
                 target.data = (float *)malloc(size);
                 if(target.data == nullptr) throw runtime_error("malloc error");
-                total += size;
+                player_cfv[mem_idx] = vector<atomic_float>(target.size);
+                target.cfv = player_cfv[mem_idx].data();
+                total += size + target.size * sizeof(atomic_float);
                 dfs_idx_map[idx] = mem_idx++;
             }
         }
         slice_offset[i].push_back(mem_idx);
     }
-    mtx = vector<mutex>(mtx_idx);
-    printf("%d,%d,%d\n", sizeof(mutex), mtx_idx, mtx_idx * sizeof(mutex));
-    total += mtx_idx * sizeof(mutex);
-    for(int i : dfs_idx_map) {
-        if(i == -1) continue;
-        player_node[i].mtx = &mtx[(size_t)(player_node[i].mtx)];
-    }
+    // mtx = vector<mutex>(mtx_idx);
+    // printf("%d,%d,%d\n", sizeof(mutex), mtx_idx, mtx_idx * sizeof(mutex));
+    // total += mtx_idx * sizeof(mutex);
+    // for(int i : dfs_idx_map) {
+    //     if(i == -1) continue;
+    //     player_node[i].mtx = &mtx[(size_t)(player_node[i].mtx)];
+    // }
     total += n_player_node * sizeof(Node);
     return total;
 }
@@ -438,12 +440,11 @@ size_t SliceCFR::init_player_node() {
 size_t SliceCFR::init_memory(shared_ptr<Compairer> compairer) {
     size_t total = 0;
     int n = root_prob.size();
-    root_cfv = vector<float>(n<<1, 0);
-    for(int i = 0; i < n; i++) root_cfv[n+i] = root_prob[i];
-    total += n * 3 * sizeof(float);
+    root_cfv = vector<atomic_float>(n);
+    total += n * sizeof(float) + n * sizeof(atomic_float);
     root_cfv_ptr[P0] = root_cfv.data();
     root_cfv_ptr[P1] = root_cfv_ptr[P0] + hand_size[P0];
-    root_prob_ptr[P0] = root_cfv_ptr[P0] + n;
+    root_prob_ptr[P0] = root_prob.data();
     root_prob_ptr[P1] = root_prob_ptr[P0] + hand_size[P0];
     
     total += init_player_node();
@@ -570,7 +571,7 @@ size_t SliceCFR::estimate_tree_size() {
     size_t size = _estimate_tree_size(tree->getRoot());
     n_leaf_node = node_cnt[FOLD_TYPE] + node_cnt[SHOWDOWN_TYPE];
     n_player_node = node_cnt[N_LEAF_TYPE+P0] + node_cnt[N_LEAF_TYPE+P1];
-    size *= sizeof(float);
+    // size *= sizeof(float);
     size += n_leaf_node * sizeof(LeafNode);
     size += n_player_node * sizeof(Node);
     return size;
@@ -585,7 +586,8 @@ size_t SliceCFR::_estimate_tree_size(shared_ptr<GameTreeNode> node) {
         n_act = children.size();
         int player = act_node->getPlayer();
         node_cnt[N_LEAF_TYPE + player]++;
-        size += get_size(n_act, hand_size[player]);
+        size += get_size(n_act, hand_size[player]) * sizeof(float);
+        size += get_size1(n_act, hand_size[player]);
         for(int i = 0; i < n_act; i++) size += _estimate_tree_size(children[i]);
     }
     else if(type == GameTreeNode::CHANCE) {
@@ -723,11 +725,19 @@ void SliceCFR::clear_data(int player) {
         size = get_size(player_node_ptr[i].n_act, n_hand) * sizeof(float);
         memset(player_node_ptr[i].data, 0, size);
     }
+    #pragma omp parallel for
+    for(int i = s; i < e; i++) {
+        atomic_float *cfv = player_node_ptr[i].cfv;
+        int size = player_node_ptr[i].size;
+        for(int j = 0; j < size; j++) cfv[j].store(0, memory_order_relaxed);
+    }
 }
 
 void SliceCFR::clear_root_cfv() {
-    size_t size = root_prob.size() * sizeof(float);
-    memset(root_cfv_ptr[P0], 0, size);
+    // size_t size = root_prob.size() * sizeof(float);
+    // memset(root_cfv_ptr[P0], 0, size);
+    int n = root_cfv.size();
+    for(int i = 0; i < n; i++) root_cfv[i].store(0, memory_order_relaxed);
 }
 
 void SliceCFR::train() {
@@ -799,7 +809,7 @@ void SliceCFR::step(int iter, int player, bool best_cfv) {
     if(!best_cfv) {
         #pragma omp parallel for
         for(int j = offset[0]; j < offset.back(); j++) {
-            updata_data(player_node_ptr+j, my_hand, pos_coef, neg_coef, coef);
+            updata_data(player_node_ptr+j, pos_coef, neg_coef, coef);
         }
     }
 #ifdef TIME_LOG
